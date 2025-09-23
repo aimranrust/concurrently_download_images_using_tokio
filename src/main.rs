@@ -3,6 +3,8 @@ use serde::Deserialize;
 use tokio::fs;
 use futures::stream::{FuturesUnordered, StreamExt};
 
+use std::{env, path::PathBuf};
+
 #[derive(Debug, Deserialize)]
 struct Product {
     #[serde(rename = "$iFrame_IMAGE")]
@@ -22,7 +24,15 @@ struct Product {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load JSON file (array of objects)
-    let data = fs::read_to_string("./src/products.json").await?;
+    let exe_dir: PathBuf = env::current_exe()?
+    .parent()
+    .unwrap()
+    .to_path_buf();
+
+    let json_path = exe_dir.join("products.json");
+    let data = fs::read_to_string(json_path).await?;
+    // let data = fs::read_to_string("./products.json").await?;
+    // let data = fs::read_to_string("./src/products.json").await?;
     let products: Vec<Product> = serde_json::from_str(&data)?;
 if let Some(first) = products.first() {
     println!("First product: {:#?}", first);
