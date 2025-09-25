@@ -14,10 +14,16 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
+/// Product as stored in JSON.
+///
+/// `$iFrame_IMAGE` in the input is read into `original_image_url` and is
+/// used for downloading.  
+/// `$iFrame_IMAGE` in the **output** is written from `new_image_url`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct Product {
+    /// The URL from the input JSON we will download from
     #[serde(rename = "$iFrame_IMAGE")]
-    image_url: Option<String>,
+    original_image_url: Option<String>,
 
     #[serde(default)]
     localfilename: String,
@@ -25,17 +31,22 @@ struct Product {
     #[serde(default)]
     dbhash: String,
 
-    // Capture all other fields dynamically
+    /// The URL to write back to the output JSON
+    #[serde(rename = "$iFrame_IMAGE")]
+    #[serde(skip_deserializing)]
+    new_image_url: Option<String>,
+
+    /// Any other fields we don't explicitly model
     #[serde(flatten)]
     extra: HashMap<String, serde_json::Value>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // --------- find folder of the running exe -------------
+    // Location of the executable
     let exe_dir: PathBuf = env::current_exe()?.parent().unwrap().to_path_buf();
 
-    // --------- read JSON file name from command line ------
+    // JSON file passed as the first command-line argument
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         eprintln!("Usage: {} <json-file>", args[0]);
@@ -44,14 +55,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let json_file_name = &args[1];
     let json_path = exe_dir.join(json_file_name);
 
-    // --------- load products ------------------------------
+    // Load the JSON file
     let data = fs::read_to_string(&json_path).await?;
     let mut products: Vec<Product> = serde_json::from_str(&data)?;
 
-    // --------- update each product's image_url ------------
+    // Prepare the new URLs that will be written to the modified JSON
     const SERVER_IMAGES_FOLDER: &str = "images";
     for p in &mut products {
-        if let Some(_) = p.image_url {
+        if p.original_image_url.is_some() {
             let brandfolder = p
                 .extra
                 .get("$iBrand")
@@ -60,54 +71,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .replace(' ', "_")
                 .replace('\'', "")
                 .to_lowercase();
-            p.image_url = Some(format!(
+            p.new_image_url = Some(format!(
                 "https://portal.framescloud.optiserver.co.uk/{}/{}/{}",
-                SERVER_IMAGES_FOLDER, brandfolder, p.localfilename
+                SERVER_IMAGES_FOLDER,
+                brandfolder,
+                p.localfilename
             ));
         }
     }
 
     let client = reqwest::Client::new();
-
     let total = products.len();
     let counter = Arc::new(AtomicUsize::new(0));
-
-    // --------- concurrent downloads -----------------------
     let mut tasks = FuturesUnordered::new();
 
+    // Download each image concurrently
     for product in products.clone() {
-        if let Some(url) = product.image_url.clone() {
+        if let Some(url) = product.original_image_url.clone() {
             let filename = if product.localfilename.is_empty() {
                 format!("{}.jpg", product.dbhash)
             } else {
                 product.localfilename.clone()
             };
 
-            // create brand subfolder if necessary
-            if let Some(brand) = product
-                .extra
-                .get("$iBrand")
-                .and_then(|v| v.as_str())
-            {
+            if let Some(brand) = product.extra.get("$iBrand").and_then(|v| v.as_str()) {
                 let brandfolder = brand
                     .replace(' ', "_")
                     .replace('\'', "")
                     .to_lowercase();
                 tokio::fs::create_dir_all(&brandfolder).await?;
-                let filename = format!("{}/{}", brandfolder, filename);
+                let filepath = format!("{}/{}", brandfolder, filename);
 
                 let client = client.clone();
                 let counter = counter.clone();
+                let total = total;
 
                 tasks.push(tokio::spawn(async move {
-                    match maybe_download(&client, &url, &filename).await {
+                    match maybe_download(&client, &url, &filepath).await {
                         Ok(true) => {
                             let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                            println!("✅ Downloading {n} of {total}: {url} → {filename}");
+                            println!("✅ Downloaded {n} of {total}: {url} → {filepath}");
                         }
                         Ok(false) => {
                             let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                            println!("⏩ Skipped {n} of {total}: {filename}, already exists");
+                            println!("⏩ Skipped {n} of {total}: {filepath}, already exists");
                         }
                         Err(e) => eprintln!("❌ Failed {url}: {e}"),
                     }
@@ -116,10 +123,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // wait for all downloads to complete
+    // Wait for all downloads to finish
     while let Some(_) = tasks.next().await {}
 
-    // --------- save modified JSON -------------------------
+    // Write the modified JSON with new URLs
     let new_name = format!(
         "{}-modified-w-embedded-imgs.json",
         json_file_name.trim_end_matches(".json")
@@ -134,22 +141,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Download `url` to `filename` unless it already exists.
+/// Returns Ok(true) if a download occurred, Ok(false) if skipped.
 async fn maybe_download(
     client: &reqwest::Client,
     url: &str,
     filename: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    // If file already exists, skip
     if fs::try_exists(filename).await? {
         return Ok(false);
     }
 
-    // Otherwise download
     let resp = client.get(url).send().await?;
-    let bytes = resp.bytes().await?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP error {}", resp.status()).into());
+    }
 
+    let bytes = resp.bytes().await?;
     let mut file = File::create(Path::new(filename))?;
     file.write_all(&bytes)?;
-
     Ok(true)
 }
